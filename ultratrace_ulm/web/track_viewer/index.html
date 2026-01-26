@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Brane</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { overflow: hidden; background: #000; }
+      canvas { display: block; }
+      #info {
+        position: absolute;
+        bottom: 12px;
+        left: 12px;
+        color: rgba(255,255,255,0.5);
+        font: 12px/1.4 monospace;
+        pointer-events: none;
+        user-select: none;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+          "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.min.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="info">Brane</div>
+    <script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+import GUI from "lil-gui";
+
+// ============================================================
+// Shaders
+// ============================================================
+
+const vertexShader = `
+precision highp float;
+
+attribute float aSpeed;
+attribute float aIntensity;
+attribute float aRandom;
+
+uniform float u_pointSize;
+uniform float u_pixelRatio;
+uniform float u_jitter;
+uniform float u_time;
+uniform float u_speedFilter;
+uniform float u_speedBand;
+uniform int u_useIntensity;
+
+varying float vSpeed;
+varying float vIntensity;
+
+void main() {
+  vSpeed = aSpeed;
+  vIntensity = aIntensity;
+
+  if (u_speedFilter > 0.0 && abs(aSpeed - u_speedFilter) > u_speedBand) {
+    gl_PointSize = 0.0;
+    gl_Position = vec4(0.0);
+    return;
+  }
+
+  float seed = aRandom * 6.2831;
+  vec3 pos = position + u_jitter * vec3(
+    sin(seed * 13.7 + u_time * 2.1),
+    sin(seed * 17.3 + u_time * 1.7),
+    sin(seed * 11.1 + u_time * 2.5)
+  );
+
+  vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+  float dist = -mvPosition.z;
+  float size = u_pointSize * u_pixelRatio * (300.0 / max(dist, 1.0));
+
+  if (u_useIntensity == 1) {
+    size *= aIntensity;
+  }
+
+  gl_PointSize = size;
+  gl_Position = projectionMatrix * mvPosition;
+}
+`;
+
+const fragmentShader = `
+precision highp float;
+
+varying float vSpeed;
+varying float vIntensity;
+
+uniform float u_maxSpeed;
+uniform int u_colormap;
+uniform int u_useIntensity;
+
+vec3 cmapJet(float t) {
+  t = clamp(t, 0.0, 1.0);
+  if (t < 0.25) return mix(vec3(0.1, 0.2, 0.8), vec3(0.0, 0.7, 0.9), t / 0.25);
+  if (t < 0.5)  return mix(vec3(0.0, 0.7, 0.9), vec3(0.1, 0.9, 0.2), (t - 0.25) / 0.25);
+  if (t < 0.75) return mix(vec3(0.1, 0.9, 0.2), vec3(0.95, 0.85, 0.1), (t - 0.5) / 0.25);
+  return mix(vec3(0.95, 0.85, 0.1), vec3(0.9, 0.1, 0.1), (t - 0.75) / 0.25);
+}
+
+vec3 cmapInferno(float t) {
+  t = clamp(t, 0.0, 1.0);
+  if (t < 0.33) return mix(vec3(0.0, 0.0, 0.04), vec3(0.55, 0.1, 0.52), t / 0.33);
+  if (t < 0.66) return mix(vec3(0.55, 0.1, 0.52), vec3(0.93, 0.47, 0.1), (t - 0.33) / 0.33);
+  return mix(vec3(0.93, 0.47, 0.1), vec3(0.99, 0.96, 0.64), (t - 0.66) / 0.34);
+}
+
+vec3 cmapViridis(float t) {
+  t = clamp(t, 0.0, 1.0);
+  if (t < 0.33) return mix(vec3(0.27, 0.0, 0.33), vec3(0.17, 0.32, 0.54), t / 0.33);
+  if (t < 0.66) return mix(vec3(0.17, 0.32, 0.54), vec3(0.13, 0.66, 0.47), (t - 0.33) / 0.33);
+  return mix(vec3(0.13, 0.66, 0.47), vec3(0.99, 0.91, 0.14), (t - 0.66) / 0.34);
+}
+
+vec3 cmapPlasma(float t) {
+  t = clamp(t, 0.0, 1.0);
+  if (t < 0.33) return mix(vec3(0.05, 0.03, 0.53), vec3(0.56, 0.07, 0.55), t / 0.33);
+  if (t < 0.66) return mix(vec3(0.56, 0.07, 0.55), vec3(0.92, 0.42, 0.18), (t - 0.33) / 0.33);
+  return mix(vec3(0.92, 0.42, 0.18), vec3(0.94, 0.97, 0.13), (t - 0.66) / 0.34);
+}
+
+vec3 cmapCoolwarm(float t) {
+  t = clamp(t, 0.0, 1.0);
+  if (t < 0.5) return mix(vec3(0.23, 0.30, 0.75), vec3(0.87, 0.87, 0.87), t / 0.5);
+  return mix(vec3(0.87, 0.87, 0.87), vec3(0.71, 0.02, 0.15), (t - 0.5) / 0.5);
+}
+
+vec3 cmapHot(float t) {
+  t = clamp(t, 0.0, 1.0);
+  if (t < 0.33) return mix(vec3(0.0, 0.0, 0.0), vec3(0.9, 0.0, 0.0), t / 0.33);
+  if (t < 0.66) return mix(vec3(0.9, 0.0, 0.0), vec3(1.0, 0.9, 0.0), (t - 0.33) / 0.33);
+  return mix(vec3(1.0, 0.9, 0.0), vec3(1.0, 1.0, 1.0), (t - 0.66) / 0.34);
+}
+
+vec3 cmapTurbo(float t) {
+  t = clamp(t, 0.0, 1.0);
+  if (t < 0.2)  return mix(vec3(0.19, 0.07, 0.23), vec3(0.16, 0.34, 0.85), t / 0.2);
+  if (t < 0.4)  return mix(vec3(0.16, 0.34, 0.85), vec3(0.06, 0.72, 0.65), (t - 0.2) / 0.2);
+  if (t < 0.6)  return mix(vec3(0.06, 0.72, 0.65), vec3(0.44, 0.88, 0.12), (t - 0.4) / 0.2);
+  if (t < 0.8)  return mix(vec3(0.44, 0.88, 0.12), vec3(0.95, 0.65, 0.04), (t - 0.6) / 0.2);
+  return mix(vec3(0.95, 0.65, 0.04), vec3(0.76, 0.15, 0.11), (t - 0.8) / 0.2);
+}
+
+vec3 applyColormap(float t) {
+  if (u_colormap == 1) return cmapInferno(t);
+  if (u_colormap == 2) return cmapViridis(t);
+  if (u_colormap == 3) return cmapPlasma(t);
+  if (u_colormap == 4) return cmapCoolwarm(t);
+  if (u_colormap == 5) return cmapHot(t);
+  if (u_colormap == 6) return cmapTurbo(t);
+  return cmapJet(t);
+}
+
+void main() {
+  vec2 cxy = 2.0 * gl_PointCoord - 1.0;
+  float r2 = dot(cxy, cxy);
+  if (r2 > 1.0) discard;
+
+  float t;
+  if (u_useIntensity == 1) {
+    t = vIntensity;
+  } else {
+    t = vSpeed / max(u_maxSpeed, 0.001);
+  }
+  vec3 color = applyColormap(t);
+
+  gl_FragColor = vec4(color, 1.0);
+}
+`;
+
+// ============================================================
+// TrackLoader
+// ============================================================
+
+const MAGIC = 0x554c4d54;
+
+async function loadTracks(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Failed to load ${url}: ${response.status}`);
+  const buffer = await response.arrayBuffer();
+
+  const headerView = new DataView(buffer, 0, 64);
+  const magic = headerView.getUint32(0, true);
+  if (magic !== MAGIC) throw new Error(`Bad magic: 0x${magic.toString(16)}`);
+
+  const version = headerView.getUint32(4, true);
+  if (version !== 2 && version !== 3) throw new Error(`Unsupported version: ${version}`);
+
+  const floatsPerPoint = version >= 3 ? 6 : 5;
+  const nTracks = headerView.getUint32(8, true);
+  const totalPoints = headerView.getUint32(12, true);
+  const maxSpeed = headerView.getFloat32(16, true);
+
+  const boundsMin = [
+    headerView.getFloat32(20, true),
+    headerView.getFloat32(24, true),
+    headerView.getFloat32(28, true),
+  ];
+  const boundsMax = [
+    headerView.getFloat32(32, true),
+    headerView.getFloat32(36, true),
+    headerView.getFloat32(40, true),
+  ];
+
+  const tableOffset = 64;
+  const tableView = new DataView(buffer, tableOffset, nTracks * 8);
+  const tracks = new Array(nTracks);
+  for (let i = 0; i < nTracks; i++) {
+    tracks[i] = {
+      pointOffset: tableView.getUint32(i * 8, true),
+      length: tableView.getUint32(i * 8 + 4, true),
+    };
+  }
+
+  const pointDataOffset = tableOffset + nTracks * 8;
+  const pointData = new Float32Array(buffer, pointDataOffset, totalPoints * floatsPerPoint);
+
+  return { nTracks, totalPoints, maxSpeed, boundsMin, boundsMax, tracks, pointData, floatsPerPoint };
+}
+
+// ============================================================
+// TrackSystem
+// ============================================================
+
+class TrackSystem {
+  constructor(trackData, particlesPerTrack = 1) {
+    this.trackData = trackData;
+    this.particlesPerTrack = particlesPerTrack;
+    const { nTracks, tracks, pointData } = trackData;
+    const fpp = trackData.floatsPerPoint || 5;
+    this.floatsPerPoint = fpp;
+    const totalParticles = nTracks * particlesPerTrack;
+
+    this.frameSpans = new Float32Array(nTracks);
+    this.frameStarts = new Float32Array(nTracks);
+    for (let i = 0; i < nTracks; i++) {
+      const off = tracks[i].pointOffset * fpp;
+      const len = tracks[i].length;
+      const firstFrame = pointData[off + 3];
+      const lastFrame = pointData[off + (len - 1) * fpp + 3];
+      this.frameSpans[i] = Math.max(lastFrame - firstFrame, 1);
+      this.frameStarts[i] = firstFrame;
+    }
+
+    this.progress = new Float32Array(totalParticles);
+    for (let i = 0; i < totalParticles; i++) {
+      this.progress[i] = Math.random();
+    }
+
+    const positions = new Float32Array(totalParticles * 3);
+    const speeds = new Float32Array(totalParticles);
+    const intensities = new Float32Array(totalParticles);
+    const randoms = new Float32Array(totalParticles);
+    for (let i = 0; i < totalParticles; i++) {
+      randoms[i] = Math.random();
+    }
+
+    this.positionAttr = new THREE.BufferAttribute(positions, 3);
+    this.positionAttr.setUsage(THREE.DynamicDrawUsage);
+    this.speedAttr = new THREE.BufferAttribute(speeds, 1);
+    this.speedAttr.setUsage(THREE.DynamicDrawUsage);
+    this.intensityAttr = new THREE.BufferAttribute(intensities, 1);
+    this.intensityAttr.setUsage(THREE.DynamicDrawUsage);
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", this.positionAttr);
+    geometry.setAttribute("aSpeed", this.speedAttr);
+    geometry.setAttribute("aIntensity", this.intensityAttr);
+    geometry.setAttribute("aRandom", new THREE.BufferAttribute(randoms, 1));
+
+    this.uniforms = {
+      u_pointSize: { value: 0.3 },
+      u_pixelRatio: { value: window.devicePixelRatio },
+      u_maxSpeed: { value: trackData.maxSpeed * 0.5 },
+      u_colormap: { value: 0 },
+      u_jitter: { value: 0.0 },
+      u_time: { value: 0.0 },
+      u_speedFilter: { value: -1.0 },
+      u_speedBand: { value: 0.08 },
+      u_useIntensity: { value: 0 },
+    };
+
+    const material = new THREE.ShaderMaterial({
+      vertexShader,
+      fragmentShader,
+      uniforms: this.uniforms,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+    });
+
+    this.points = new THREE.Points(geometry, material);
+    this._interpolateAll();
+  }
+
+  getObject3D() {
+    return this.points;
+  }
+
+  update(dt, speedMultiplier) {
+    this.uniforms.u_time.value += dt;
+    const { nTracks } = this.trackData;
+    const ppt = this.particlesPerTrack;
+    const totalParticles = nTracks * ppt;
+    for (let p = 0; p < totalParticles; p++) {
+      const trackIdx = (p / ppt) | 0;
+      this.progress[p] += (dt * speedMultiplier) / this.frameSpans[trackIdx];
+      this.progress[p] -= Math.floor(this.progress[p]);
+    }
+    this._interpolateAll();
+  }
+
+  setRenderParams({ pointSize, maxSpeed, colormap, jitter, speedFilter, maxSpeedData, useIntensity }) {
+    if (pointSize !== undefined) this.uniforms.u_pointSize.value = pointSize;
+    if (maxSpeed !== undefined) this.uniforms.u_maxSpeed.value = maxSpeed;
+    if (colormap !== undefined) this.uniforms.u_colormap.value = colormap;
+    if (jitter !== undefined) this.uniforms.u_jitter.value = jitter;
+    if (speedFilter !== undefined) this.uniforms.u_speedFilter.value = speedFilter;
+    if (maxSpeedData !== undefined) this.uniforms.u_speedBand.value = maxSpeedData * 0.02;
+    if (useIntensity !== undefined) this.uniforms.u_useIntensity.value = useIntensity ? 1 : 0;
+  }
+
+  _interpolateAll() {
+    const { nTracks, tracks, pointData } = this.trackData;
+    const fpp = this.floatsPerPoint;
+    const hasIntensity = fpp >= 6;
+    const ppt = this.particlesPerTrack;
+    const posArr = this.positionAttr.array;
+    const spdArr = this.speedAttr.array;
+    const intArr = this.intensityAttr.array;
+
+    for (let i = 0; i < nTracks; i++) {
+      const track = tracks[i];
+      const off = track.pointOffset * fpp;
+      const len = track.length;
+
+      for (let j = 0; j < ppt; j++) {
+        const p = i * ppt + j;
+        const progress = this.progress[p];
+        const targetFrame = this.frameStarts[i] + progress * this.frameSpans[i];
+
+        let lo = 0;
+        let hi = len - 1;
+        while (lo < hi - 1) {
+          const mid = (lo + hi) >>> 1;
+          if (pointData[off + mid * fpp + 3] <= targetFrame) {
+            lo = mid;
+          } else {
+            hi = mid;
+          }
+        }
+
+        const f0 = pointData[off + lo * fpp + 3];
+        const f1 = pointData[off + hi * fpp + 3];
+        const segLen = f1 - f0;
+        const t = segLen > 0 ? (targetFrame - f0) / segLen : 0;
+
+        const x0 = pointData[off + lo * fpp];
+        const y0 = pointData[off + lo * fpp + 1];
+        const z0 = pointData[off + lo * fpp + 2];
+        const x1 = pointData[off + hi * fpp];
+        const y1 = pointData[off + hi * fpp + 1];
+        const z1 = pointData[off + hi * fpp + 2];
+
+        posArr[p * 3] = x0 + t * (x1 - x0);
+        posArr[p * 3 + 1] = y0 + t * (y1 - y0);
+        posArr[p * 3 + 2] = z0 + t * (z1 - z0);
+
+        const s0 = pointData[off + lo * fpp + 4];
+        const s1 = pointData[off + hi * fpp + 4];
+        spdArr[p] = s0 + t * (s1 - s0);
+
+        if (hasIntensity) {
+          const i0 = pointData[off + lo * fpp + 5];
+          const i1 = pointData[off + hi * fpp + 5];
+          intArr[p] = i0 + t * (i1 - i0);
+        } else {
+          intArr[p] = 1.0;
+        }
+      }
+    }
+
+    this.positionAttr.needsUpdate = true;
+    this.speedAttr.needsUpdate = true;
+    this.intensityAttr.needsUpdate = true;
+  }
+}
+
+// ============================================================
+// App
+// ============================================================
+
+const params = {
+  speedMultiplier: 10.755,
+  pointSize: 0.3762,
+  maxSpeed: 0.1713,
+  colormap: 0,       // Jet
+  jitter: 0.02,
+  speedFilter: 0.0,
+  particlesPerTrack: 40,
+  useIntensity: true,
+  paused: false,
+};
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setClearColor(0x010104);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.up.set(0, 0, 1);
+camera.position.set(15, 10, 30);
+
+const orbitControls = new OrbitControls(camera, renderer.domElement);
+orbitControls.enableDamping = true;
+orbitControls.dampingFactor = 0.05;
+orbitControls.target.set(0, 0, 15);
+orbitControls.update();
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new OutputPass());
+
+const info = document.getElementById("info");
+info.textContent = "Loading tracks...";
+
+let trackSystem = null;
+let trackData = null;
+
+function applyParams() {
+  if (!trackSystem) return;
+  trackSystem.setRenderParams({
+    pointSize: params.pointSize,
+    maxSpeed: params.maxSpeed,
+    colormap: params.colormap,
+    jitter: params.jitter,
+    speedFilter: params.speedFilter,
+    maxSpeedData: trackData ? trackData.maxSpeed : 1.0,
+    useIntensity: params.useIntensity,
+  });
+}
+
+async function init() {
+  try {
+    trackData = await loadTracks("data/tracks.bin");
+    info.textContent = `Loaded ${trackData.nTracks.toLocaleString()} tracks (${trackData.totalPoints.toLocaleString()} points)`;
+
+    trackSystem = new TrackSystem(trackData, params.particlesPerTrack);
+    scene.add(trackSystem.getObject3D());
+
+    const bmin = new THREE.Vector3(...trackData.boundsMin);
+    const bmax = new THREE.Vector3(...trackData.boundsMax);
+    const size = bmax.clone().sub(bmin);
+    const center = bmin.clone().add(size.clone().multiplyScalar(0.5));
+
+    const boxGeo = new THREE.BoxGeometry(size.x, size.y, size.z);
+    const boxEdges = new THREE.EdgesGeometry(boxGeo);
+    const boxLine = new THREE.LineSegments(
+      boxEdges,
+      new THREE.LineBasicMaterial({ color: 0x333355, linewidth: 1 })
+    );
+    boxLine.position.copy(center);
+    scene.add(boxLine);
+
+    orbitControls.target.copy(center);
+    camera.position.set(
+      center.x,
+      center.y + Math.max(size.x, size.z) * 1.2,
+      center.z
+    );
+    orbitControls.update();
+
+    // GUI: only Speed and Speed Filter
+    const gui = new GUI({ title: "Brane" });
+    gui.add(params, "speedMultiplier", 1, 240).name("Speed (frames/s)").onChange(applyParams);
+    const maxSpd = trackData.maxSpeed;
+    gui.add(params, "speedFilter", 0, maxSpd).name("Speed Filter").onChange(applyParams);
+
+    applyParams();
+    info.textContent = `${trackData.nTracks.toLocaleString()} tracks | drag to orbit`;
+  } catch (err) {
+    console.error(err);
+    info.textContent = `Error: ${err.message}`;
+  }
+}
+
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  orbitControls.update();
+  if (trackSystem && !params.paused) {
+    trackSystem.update(dt, params.speedMultiplier);
+  }
+  composer.render();
+}
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+init();
+animate();
+    </script>
+  </body>
+</html>
