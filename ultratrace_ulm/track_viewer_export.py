@@ -1,0 +1,231 @@
+"""Export ULM tracks to the compact binary the 3D track viewer reads.
+
+Produces ``tracks.bin`` in the viewer's v3 layout:
+
+    Header (64 bytes):
+        0:  uint32  magic         0x554C4D54 ("ULMT")
+        4:  uint32  version       3
+        8:  uint32  n_tracks
+        12: uint32  total_points
+        16: float32 max_speed     (mm/frame, after smoothing)
+        20: 3xf32   bounds_min    (x, y, z) mm
+        32: 3xf32   bounds_max    (x, y, z) mm
+        44: padding to 64 bytes
+    Track table (n_tracks x 8 bytes): uint32 point_offset, uint32 length
+    Point data (total_points x 24 bytes): f32 x, y, z, frame, speed, intensity
+
+Optional per-point B-mode intensity is sampled from a beamformed ultratrace H5
+using this package's own SVD clutter filter. The runtime stays self-contained:
+no external dependencies beyond numpy and scipy.
+"""
+
+from __future__ import annotations
+
+import shutil
+import struct
+from importlib import resources
+from pathlib import Path
+
+import numpy as np
+from scipy.ndimage import gaussian_filter1d, map_coordinates
+
+from .h5_io import compound_dataset, grid_arrays, acq_keys, open_h5
+from .runtime import load_pickle
+from .svd import filter_svd_3d
+
+MAGIC = 0x554C4D54
+VERSION = 3
+
+
+def _track_length(track: dict) -> int:
+    return int(track.get("length", len(track["positions"])))
+
+
+def smooth_track_speeds(positions: np.ndarray, frames: np.ndarray, sigma: float = 10.0) -> np.ndarray:
+    """Gaussian-smoothed speed (mm/frame) at each point along a track."""
+    n = len(positions)
+    if n < 2:
+        return np.zeros(n, dtype=np.float32)
+
+    dp = np.diff(positions, axis=0)
+    df = np.diff(frames).astype(np.float64)
+    df[df == 0] = 1.0
+    vel = dp / df[:, np.newaxis]
+
+    vel_full = np.empty((n, 3), dtype=np.float64)
+    vel_full[0] = vel[0]
+    vel_full[-1] = vel[-1]
+    vel_full[1:-1] = 0.5 * (vel[:-1] + vel[1:])
+
+    if n > 2 * sigma:
+        for axis in range(3):
+            vel_full[:, axis] = gaussian_filter1d(vel_full[:, axis], sigma=sigma)
+
+    return np.linalg.norm(vel_full, axis=1).astype(np.float32)
+
+
+def _grids(data: dict, h5_path: Path | None):
+    """Return (grid_x, grid_y, grid_z) in mm, each shaped (elev, z, x)."""
+    if all(k in data for k in ("grid_x", "grid_y", "grid_z")):
+        return data["grid_x"], data["grid_y"], data["grid_z"]
+    if h5_path is None:
+        raise ValueError("Pickle has no grid arrays; pass --beamformed to read the grid from H5")
+    with open_h5(h5_path) as h5:
+        acq = acq_keys(h5)[0]
+        return grid_arrays(h5, acq)
+
+
+def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=None, svd_cutoff=0.0):
+    """Sample SVD-filtered B-mode magnitude at each track point, normalized to [0, 1]."""
+    grid_x, grid_y, grid_z = grids
+    n_elev, n_z, n_x = grid_x.shape
+    x_min, x_max = float(grid_x[0, 0, 0]), float(grid_x[0, 0, -1])
+    y_min, y_max = float(grid_y[0, 0, 0]), float(grid_y[-1, 0, 0])
+    z_min, z_max = float(grid_z[0, 0, 0]), float(grid_z[0, -1, 0])
+
+    all_intensities = [np.ones(len(s), dtype=np.float32) for s in all_speeds]
+
+    with open_h5(h5_path) as h5:
+        all_acq_ids = acq_keys(h5)
+        n_h5_acqs = len(all_acq_ids)
+        if pkl_n_acquisitions is not None and pkl_n_acquisitions < n_h5_acqs:
+            acq_ids = all_acq_ids[-pkl_n_acquisitions:]
+        else:
+            acq_ids = all_acq_ids
+
+        acq_frame_offsets = []
+        global_offset = 0
+        for acq_id in acq_ids:
+            n_frames = compound_dataset(h5, acq_id).shape[0]
+            acq_frame_offsets.append((acq_id, global_offset, n_frames))
+            global_offset += n_frames
+
+        records = []
+        for ti, t in enumerate(tracks):
+            pos, frames = t["positions"], t["frames"]
+            for pi in range(len(frames)):
+                records.append((ti, pi, int(frames[pi]),
+                                float(pos[pi, 0]), float(pos[pi, 1]), float(pos[pi, 2])))
+        records.sort(key=lambda r: r[2])
+
+        rec_idx = 0
+        for acq_id, acq_start, acq_n in acq_frame_offsets:
+            acq_end = acq_start + acq_n
+            acq_points = []
+            while rec_idx < len(records) and records[rec_idx][2] < acq_end:
+                if records[rec_idx][2] >= acq_start:
+                    acq_points.append(records[rec_idx])
+                rec_idx += 1
+            if not acq_points:
+                continue
+
+            compound_raw = np.asarray(compound_dataset(h5, acq_id))  # (frames, elev, z, x)
+            if svd_cutoff > 0:
+                # Stable full SVD: the covariance ("fast") variant is numerically
+                # unstable in float32 and not reproducible across backends.
+                compound = np.abs(filter_svd_3d(compound_raw, low_cutoff=svd_cutoff, method="full"))
+            else:
+                compound = np.abs(compound_raw)
+
+            for ti, pi, gframe, x_mm, y_mm, z_mm in acq_points:
+                fia = gframe - acq_start
+                x_idx = (x_mm - x_min) / (x_max - x_min) * (n_x - 1) if n_x > 1 else 0.0
+                elev_idx = (y_mm - y_min) / (y_max - y_min) * (n_elev - 1) if n_elev > 1 else 0.0
+                z_idx = (z_mm - z_min) / (z_max - z_min) * (n_z - 1) if n_z > 1 else 0.0
+                coords = np.array([[elev_idx], [z_idx], [x_idx]])
+                all_intensities[ti][pi] = map_coordinates(compound[fia], coords, order=1, mode="nearest")[0]
+
+    all_vals = np.concatenate(all_intensities)
+    p1, p99 = np.percentile(all_vals, [1, 99])
+    if p99 > p1:
+        for i in range(len(all_intensities)):
+            all_intensities[i] = np.clip((all_intensities[i] - p1) / (p99 - p1), 0.0, 1.0).astype(np.float32)
+    else:
+        all_intensities = [np.ones_like(a) for a in all_intensities]
+    return all_intensities
+
+
+def export_tracks_bin_v3(
+    pickle_path: Path,
+    output_path: Path,
+    min_length: int = 35,
+    sigma: float = 10.0,
+    use_smoothed: bool = True,
+    beamformed: Path | None = None,
+    svd_cutoff: float = 0.0,
+) -> Path:
+    data = load_pickle(pickle_path)
+    key = "tracks_smoothed" if use_smoothed and data.get("tracks_smoothed") else "tracks"
+    tracks = [t for t in data[key] if _track_length(t) >= min_length]
+    if not tracks:
+        raise SystemExit(f"No tracks with length >= {min_length} in {pickle_path}")
+
+    n_tracks = len(tracks)
+    total_points = sum(_track_length(t) for t in tracks)
+
+    all_speeds, all_mins, all_maxs, max_speed = [], [], [], 0.0
+    for t in tracks:
+        pos = t["positions"]  # keep original dtype for speed/bounds (cast only at write)
+        all_mins.append(np.asarray(pos).min(axis=0))
+        all_maxs.append(np.asarray(pos).max(axis=0))
+        s = smooth_track_speeds(np.asarray(pos), np.asarray(t["frames"]), sigma=sigma)
+        all_speeds.append(s)
+        if len(s):
+            max_speed = max(max_speed, float(s.max()))
+    bounds_min = np.min(all_mins, axis=0).astype(np.float32)
+    bounds_max = np.max(all_maxs, axis=0).astype(np.float32)
+
+    if beamformed is not None:
+        intensities = lookup_intensities(
+            tracks, all_speeds, beamformed, _grids(data, beamformed),
+            pkl_n_acquisitions=data.get("n_acquisitions"), svd_cutoff=svd_cutoff,
+        )
+    else:
+        intensities = [np.ones(len(s), dtype=np.float32) for s in all_speeds]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("wb") as fp:
+        header = struct.pack("<IIIIf3f3f", MAGIC, VERSION, n_tracks, total_points,
+                             max_speed, *bounds_min.tolist(), *bounds_max.tolist())
+        fp.write(header + b"\x00" * (64 - len(header)))
+        offset = 0
+        for t in tracks:
+            length = _track_length(t)
+            fp.write(struct.pack("<II", offset, length))
+            offset += length
+        for t, speeds, ints in zip(tracks, all_speeds, intensities):
+            pos = np.asarray(t["positions"], dtype=np.float32)
+            frames = np.asarray(t["frames"], dtype=np.float32)
+            point_data = np.column_stack([pos, frames[:, None], speeds[:, None], ints[:, None]])
+            fp.write(point_data.astype(np.float32).tobytes())
+
+    print(f"Exported {n_tracks} tracks ({total_points} points) -> {output_path}")
+    return output_path
+
+
+def _copy_web_assets(output_dir: Path) -> None:
+    asset_root = resources.files("ultratrace_ulm.web.track_viewer")
+    with resources.as_file(asset_root / "index.html") as src:
+        shutil.copyfile(src, output_dir / "index.html")
+
+
+def write_track_viewer(
+    pickle_path: Path,
+    output_dir: Path,
+    min_length: int = 35,
+    sigma: float = 10.0,
+    use_smoothed: bool = True,
+    beamformed: Path | None = None,
+    svd_cutoff: float = 0.0,
+) -> Path:
+    """Write a self-contained 3D track viewer bundle (index.html + data/tracks.bin)."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    export_tracks_bin_v3(
+        pickle_path, output_dir / "data" / "tracks.bin",
+        min_length=min_length, sigma=sigma, use_smoothed=use_smoothed,
+        beamformed=beamformed, svd_cutoff=svd_cutoff,
+    )
+    _copy_web_assets(output_dir)
+    print(f"Wrote 3D track viewer bundle to {output_dir}")
+    return output_dir / "index.html"
