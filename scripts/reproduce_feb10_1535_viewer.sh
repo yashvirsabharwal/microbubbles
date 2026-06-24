@@ -25,7 +25,8 @@ set -euo pipefail
 PYTHON="${PYTHON:-python3}"
 BEAMFORMED="${1:?usage: reproduce_feb10_1535_viewer.sh /path/to/beamformed.h5 /path/to/outdir}"
 OUTDIR="${2:?usage: reproduce_feb10_1535_viewer.sh /path/to/beamformed.h5 /path/to/outdir}"
-NUM_ACQS="${NUM_ACQS:-216}"
+NUM_ACQS="${NUM_ACQS:-216}"          # acquisitions to TRACK (the ULM image accumulates over all of them)
+VIEW_ACQS="${VIEW_ACQS:-12}"         # acquisitions of b-mode context to render in the volume/movie viewers
 FRAME_RATE="${FRAME_RATE:-222.4306816130359}"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -50,7 +51,7 @@ echo "[2/5] 3D SVD volume viewer"
 "${PYTHON}" -m ultratrace_ulm.cli volume \
   --beamformed "${BEAMFORMED}" --tracks "${SMOOTHED}" \
   --output-dir "${OUTDIR}/viewer/volume" \
-  --num-acqs "${NUM_ACQS}" --voxel-percentile 99.9 --max-points-per-frame 8000 \
+  --num-acqs "${VIEW_ACQS}" --voxel-percentile 99.9 --max-points-per-frame 8000 \
   --dynamic-range-db 15 --temporal-sigma 0
 
 echo "[3/5] 3D track-flow viewer"
@@ -64,7 +65,7 @@ echo "[4/5] SVD b-mode movie viewer"
 "${PYTHON}" -m ultratrace_ulm.cli movie \
   --beamformed "${BEAMFORMED}" --tracks "${SMOOTHED}" \
   --output-dir "${OUTDIR}/viewer/movie" \
-  --num-acqs "${NUM_ACQS}" --projection xz-slab-mip --elev-slabs 6 \
+  --num-acqs "${VIEW_ACQS}" --projection xz-slab-mip --elev-slabs 6 \
   --dynamic-range-db 15 --temporal-sigma 0
 
 echo "[5/5] launcher landing page"
