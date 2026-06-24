@@ -48,6 +48,7 @@ precision highp float;
 attribute float aSpeed;
 attribute float aIntensity;
 attribute float aRandom;
+attribute float aFrame;
 
 uniform float u_pointSize;
 uniform float u_pixelRatio;
@@ -55,20 +56,36 @@ uniform float u_jitter;
 uniform float u_time;
 uniform float u_speedFilter;
 uniform float u_speedBand;
+uniform float u_reveal;
+uniform float u_edge;
 uniform int u_useIntensity;
 
 varying float vSpeed;
 varying float vIntensity;
+varying float vGlow;
 
 void main() {
   vSpeed = aSpeed;
   vIntensity = aIntensity;
+  vGlow = 0.0;
+
+  // Progressive accumulation: only show samples whose (normalised) time has been
+  // reached by the reveal front. Past samples persist, so the super-resolution
+  // vessel map visibly builds up over the cycle, then resets and replays.
+  if (aFrame > u_reveal) {
+    gl_PointSize = 0.0;
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
 
   if (u_speedFilter > 0.0 && abs(aSpeed - u_speedFilter) > u_speedBand) {
     gl_PointSize = 0.0;
-    gl_Position = vec4(0.0);
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     return;
   }
+
+  // Bright, slightly larger moving front at the leading edge of the reveal.
+  vGlow = u_edge > 0.0 ? clamp(1.0 - (u_reveal - aFrame) / u_edge, 0.0, 1.0) : 0.0;
 
   float seed = aRandom * 6.2831;
   vec3 pos = position + u_jitter * vec3(
@@ -84,6 +101,7 @@ void main() {
   if (u_useIntensity == 1) {
     size *= aIntensity;
   }
+  size *= (1.0 + 1.6 * vGlow);
 
   gl_PointSize = size;
   gl_Position = projectionMatrix * mvPosition;
@@ -95,6 +113,7 @@ precision highp float;
 
 varying float vSpeed;
 varying float vIntensity;
+varying float vGlow;
 
 uniform float u_maxSpeed;
 uniform int u_colormap;
@@ -173,6 +192,7 @@ void main() {
     t = vSpeed / max(u_maxSpeed, 0.001);
   }
   vec3 color = applyColormap(t);
+  color = mix(color, vec3(1.0), 0.7 * vGlow);
 
   gl_FragColor = vec4(color, 1.0);
 }
@@ -233,50 +253,57 @@ async function loadTracks(url) {
 // ============================================================
 
 class TrackSystem {
-  constructor(trackData, particlesPerTrack = 1) {
+  constructor(trackData) {
     this.trackData = trackData;
-    this.particlesPerTrack = particlesPerTrack;
-    const { nTracks, tracks, pointData } = trackData;
+    const { nTracks, tracks, totalPoints, pointData } = trackData;
     const fpp = trackData.floatsPerPoint || 5;
     this.floatsPerPoint = fpp;
-    const totalParticles = nTracks * particlesPerTrack;
+    const hasIntensity = fpp >= 6;
 
-    this.frameSpans = new Float32Array(nTracks);
-    this.frameStarts = new Float32Array(nTracks);
+    // Global time range across all samples. Frames are global across
+    // acquisitions, so the reveal sweeps the recording in chronological order.
+    let minFrame = Infinity;
+    let maxFrame = -Infinity;
     for (let i = 0; i < nTracks; i++) {
       const off = tracks[i].pointOffset * fpp;
       const len = tracks[i].length;
-      const firstFrame = pointData[off + 3];
-      const lastFrame = pointData[off + (len - 1) * fpp + 3];
-      this.frameSpans[i] = Math.max(lastFrame - firstFrame, 1);
-      this.frameStarts[i] = firstFrame;
+      const f0 = pointData[off + 3];
+      const f1 = pointData[off + (len - 1) * fpp + 3];
+      if (f0 < minFrame) minFrame = f0;
+      if (f1 > maxFrame) maxFrame = f1;
     }
+    const span = Math.max(maxFrame - minFrame, 1);
 
-    this.progress = new Float32Array(totalParticles);
-    for (let i = 0; i < totalParticles; i++) {
-      this.progress[i] = Math.random();
+    // One persistent vertex per track sample (no per-frame interpolation).
+    const positions = new Float32Array(totalPoints * 3);
+    const speeds = new Float32Array(totalPoints);
+    const intensities = new Float32Array(totalPoints);
+    const randoms = new Float32Array(totalPoints);
+    const frames = new Float32Array(totalPoints);
+
+    let k = 0;
+    for (let i = 0; i < nTracks; i++) {
+      const off = tracks[i].pointOffset * fpp;
+      const len = tracks[i].length;
+      for (let j = 0; j < len; j++) {
+        const b = off + j * fpp;
+        positions[k * 3] = pointData[b];
+        positions[k * 3 + 1] = pointData[b + 1];
+        positions[k * 3 + 2] = pointData[b + 2];
+        speeds[k] = pointData[b + 4];
+        intensities[k] = hasIntensity ? pointData[b + 5] : 1.0;
+        randoms[k] = Math.random();
+        frames[k] = (pointData[b + 3] - minFrame) / span;
+        k++;
+      }
     }
-
-    const positions = new Float32Array(totalParticles * 3);
-    const speeds = new Float32Array(totalParticles);
-    const intensities = new Float32Array(totalParticles);
-    const randoms = new Float32Array(totalParticles);
-    for (let i = 0; i < totalParticles; i++) {
-      randoms[i] = Math.random();
-    }
-
-    this.positionAttr = new THREE.BufferAttribute(positions, 3);
-    this.positionAttr.setUsage(THREE.DynamicDrawUsage);
-    this.speedAttr = new THREE.BufferAttribute(speeds, 1);
-    this.speedAttr.setUsage(THREE.DynamicDrawUsage);
-    this.intensityAttr = new THREE.BufferAttribute(intensities, 1);
-    this.intensityAttr.setUsage(THREE.DynamicDrawUsage);
 
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", this.positionAttr);
-    geometry.setAttribute("aSpeed", this.speedAttr);
-    geometry.setAttribute("aIntensity", this.intensityAttr);
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("aSpeed", new THREE.BufferAttribute(speeds, 1));
+    geometry.setAttribute("aIntensity", new THREE.BufferAttribute(intensities, 1));
     geometry.setAttribute("aRandom", new THREE.BufferAttribute(randoms, 1));
+    geometry.setAttribute("aFrame", new THREE.BufferAttribute(frames, 1));
 
     this.uniforms = {
       u_pointSize: { value: 0.3 },
@@ -288,6 +315,8 @@ class TrackSystem {
       u_speedFilter: { value: -1.0 },
       u_speedBand: { value: 0.08 },
       u_useIntensity: { value: 0 },
+      u_reveal: { value: 0.0 },
+      u_edge: { value: 0.04 },
     };
 
     const material = new THREE.ShaderMaterial({
@@ -300,7 +329,10 @@ class TrackSystem {
     });
 
     this.points = new THREE.Points(geometry, material);
-    this._interpolateAll();
+
+    // Reveal sweeps 0 -> 1 (build-up), holds the full map, then restarts.
+    this.reveal = 0.0;
+    this.holdFraction = 0.18;
   }
 
   getObject3D() {
@@ -309,15 +341,12 @@ class TrackSystem {
 
   update(dt, speedMultiplier) {
     this.uniforms.u_time.value += dt;
-    const { nTracks } = this.trackData;
-    const ppt = this.particlesPerTrack;
-    const totalParticles = nTracks * ppt;
-    for (let p = 0; p < totalParticles; p++) {
-      const trackIdx = (p / ppt) | 0;
-      this.progress[p] += (dt * speedMultiplier) / this.frameSpans[trackIdx];
-      this.progress[p] -= Math.floor(this.progress[p]);
-    }
-    this._interpolateAll();
+    // speedMultiplier ("frames/s") drives how fast the map builds; 240 ~= 1 s.
+    const rate = Math.max(speedMultiplier, 1.0) / 240.0;
+    this.reveal += dt * rate;
+    const cycle = 1.0 + this.holdFraction;
+    if (this.reveal > cycle) this.reveal -= cycle;
+    this.uniforms.u_reveal.value = Math.min(this.reveal, 1.0);
   }
 
   setRenderParams({ pointSize, maxSpeed, colormap, jitter, speedFilter, maxSpeedData, useIntensity }) {
@@ -329,71 +358,6 @@ class TrackSystem {
     if (maxSpeedData !== undefined) this.uniforms.u_speedBand.value = maxSpeedData * 0.02;
     if (useIntensity !== undefined) this.uniforms.u_useIntensity.value = useIntensity ? 1 : 0;
   }
-
-  _interpolateAll() {
-    const { nTracks, tracks, pointData } = this.trackData;
-    const fpp = this.floatsPerPoint;
-    const hasIntensity = fpp >= 6;
-    const ppt = this.particlesPerTrack;
-    const posArr = this.positionAttr.array;
-    const spdArr = this.speedAttr.array;
-    const intArr = this.intensityAttr.array;
-
-    for (let i = 0; i < nTracks; i++) {
-      const track = tracks[i];
-      const off = track.pointOffset * fpp;
-      const len = track.length;
-
-      for (let j = 0; j < ppt; j++) {
-        const p = i * ppt + j;
-        const progress = this.progress[p];
-        const targetFrame = this.frameStarts[i] + progress * this.frameSpans[i];
-
-        let lo = 0;
-        let hi = len - 1;
-        while (lo < hi - 1) {
-          const mid = (lo + hi) >>> 1;
-          if (pointData[off + mid * fpp + 3] <= targetFrame) {
-            lo = mid;
-          } else {
-            hi = mid;
-          }
-        }
-
-        const f0 = pointData[off + lo * fpp + 3];
-        const f1 = pointData[off + hi * fpp + 3];
-        const segLen = f1 - f0;
-        const t = segLen > 0 ? (targetFrame - f0) / segLen : 0;
-
-        const x0 = pointData[off + lo * fpp];
-        const y0 = pointData[off + lo * fpp + 1];
-        const z0 = pointData[off + lo * fpp + 2];
-        const x1 = pointData[off + hi * fpp];
-        const y1 = pointData[off + hi * fpp + 1];
-        const z1 = pointData[off + hi * fpp + 2];
-
-        posArr[p * 3] = x0 + t * (x1 - x0);
-        posArr[p * 3 + 1] = y0 + t * (y1 - y0);
-        posArr[p * 3 + 2] = z0 + t * (z1 - z0);
-
-        const s0 = pointData[off + lo * fpp + 4];
-        const s1 = pointData[off + hi * fpp + 4];
-        spdArr[p] = s0 + t * (s1 - s0);
-
-        if (hasIntensity) {
-          const i0 = pointData[off + lo * fpp + 5];
-          const i1 = pointData[off + hi * fpp + 5];
-          intArr[p] = i0 + t * (i1 - i0);
-        } else {
-          intArr[p] = 1.0;
-        }
-      }
-    }
-
-    this.positionAttr.needsUpdate = true;
-    this.speedAttr.needsUpdate = true;
-    this.intensityAttr.needsUpdate = true;
-  }
 }
 
 // ============================================================
@@ -401,11 +365,11 @@ class TrackSystem {
 // ============================================================
 
 const params = {
-  speedMultiplier: 10.755,
+  speedMultiplier: 20.0,
   pointSize: 0.3762,
   maxSpeed: 0.1713,
   colormap: 0,       // Jet
-  jitter: 0.02,
+  jitter: 0.0,
   speedFilter: 0.0,
   particlesPerTrack: 40,
   useIntensity: true,
@@ -457,7 +421,7 @@ async function init() {
     trackData = await loadTracks("data/tracks.bin");
     info.textContent = `Loaded ${trackData.nTracks.toLocaleString()} tracks (${trackData.totalPoints.toLocaleString()} points)`;
 
-    trackSystem = new TrackSystem(trackData, params.particlesPerTrack);
+    trackSystem = new TrackSystem(trackData);
     scene.add(trackSystem.getObject3D());
 
     const bmin = new THREE.Vector3(...trackData.boundsMin);
