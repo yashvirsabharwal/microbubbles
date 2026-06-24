@@ -54,12 +54,11 @@ echo "[2/5] 3D SVD volume viewer"
   --dynamic-range-db 15 --temporal-sigma 0
 
 echo "[3/5] 3D track-flow viewer"
-# --svd-cutoff 0 colors points by RAW B-mode magnitude (no SVD) -- this is what
-# the live viewer shows. Use --svd-cutoff 0.1 instead for SVD-filtered intensity
-# (cleaner, weights bubble signal over tissue brightness).
+# --svd-cutoff 0.1 colors points by SVD-filtered B-mode intensity, which weights
+# bubble signal over tissue brightness (cleaner than raw --svd-cutoff 0).
 "${PYTHON}" -m ultratrace_ulm.cli track-viewer \
   --tracks "${SMOOTHED}" --output-dir "${OUTDIR}/viewer/tracks3d" \
-  --min-length 5 --sigma 10 --beamformed "${BEAMFORMED}" --svd-cutoff 0
+  --min-length 5 --sigma 10 --beamformed "${BEAMFORMED}" --svd-cutoff 0.1
 
 echo "[4/5] SVD b-mode movie viewer"
 "${PYTHON}" -m ultratrace_ulm.cli movie \
