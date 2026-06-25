@@ -23,14 +23,19 @@ The `run` subcommand chains all three (plus the data download) into one command.
 
 ## Install
 
+This project uses [uv](https://docs.astral.sh/uv/). From the repo root:
+
 ```bash
-python3.11 -m venv .venv
-.venv/bin/pip install -e .             # core: download + tracking + viewers
-.venv/bin/pip install -e ".[mach]"     # + GPU MACH beamforming (CUDA)
+uv sync                 # core: download + tracking + viewers (creates .venv)
+uv sync --extra mach    # + GPU MACH beamforming (CUDA host only)
 ```
 
+`uv sync` installs the exact, locked versions (`uv.lock`). Run any command with
+`uv run ultratrace-ulm ...`, or activate the environment with
+`source .venv/bin/activate` and call `ultratrace-ulm` directly.
+
 The core install has no GPU dependency. Beamforming (`beamform`, and the
-beamform step of `run`) needs the `[mach]` extra and a CUDA host.
+beamform step of `run`) needs the `mach` extra and a CUDA host.
 
 ## Quick start
 
@@ -38,7 +43,7 @@ One command — download the sample data, beamform it, track, and build the 3D
 track viewer:
 
 ```bash
-ultratrace-ulm run --spatial-tgc --frame-rate 222
+uv run ultratrace-ulm run --spatial-tgc --frame-rate 222
 cd outputs/viewer && python3 -m http.server 8080   # open http://localhost:8080
 ```
 
