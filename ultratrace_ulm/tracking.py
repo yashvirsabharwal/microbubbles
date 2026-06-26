@@ -4,9 +4,11 @@ import json
 import re
 import struct
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 
 import numpy as np
+import scipy.signal
 from scipy.ndimage import gaussian_filter, gaussian_filter1d, map_coordinates, maximum_filter
 from scipy.optimize import linear_sum_assignment
 
@@ -42,10 +44,13 @@ class TrackingOptions:
     max_dist: tuple[float, float, float] | None = None
     max_dist_mms: tuple[float, float, float] | None = None
     max_gap: int = 3
-    min_track_length: int = 5
+    min_track_length: int = 15
     reversal_penalty: float = 10.0
     max_cost: float = 10.0
     smooth_sigma: float = 2.0
+    smooth_method: str = "gaussian"
+    smooth_window: int = 5
+    smooth_interp_factor: float = 0.1
     export_dir: Path | None = None
     export_stem: str | None = None
     export_min_lengths: tuple[int, ...] = (5, 20, 50)
@@ -869,40 +874,177 @@ def combine_per_acq_pickles(pattern: str, output_path: Path) -> Path:
     return output_path
 
 
-def _smooth_tracks(tracks: list[dict], sigma: float) -> list[dict]:
+def _moving_average_smooth(data: np.ndarray, window: int = 5) -> np.ndarray:
+    """Moving-average smoothing along axis 0.
+
+    Boundary points use a shrinking, symmetric average instead of zero-padding,
+    so the endpoints are not pulled toward zero. A fractional ``window`` (<1) is
+    interpreted as a fraction of the track length (made odd).
+    """
+    if data.ndim < 2:
+        data = np.expand_dims(data, 1)
+    if data.shape[0] < window:
+        return data
+    if window < 1:
+        window = ceil(data.shape[0] * window)
+        window = int(window - 1 + (window % 2))
+    window = int(window)
+    mask = np.ones((window, 1)) / window
+    out = scipy.signal.convolve(data, mask, "valid")
+    r = np.arange(1, window - 1, 2)[:, None]
+    head = np.cumsum(data[: window - 1, :], axis=0)[::2, :] / r
+    tail = np.cumsum(data[:-window:-1, :], axis=0)[::2, :] / r
+    tail = tail[::-1, :]
+    return np.concatenate((head, out, tail), axis=0)
+
+
+def _curvilinear_abscissa(points: np.ndarray) -> np.ndarray:
+    """Cumulative arc length along a polyline of (N, D) points."""
+    seg = np.linalg.norm(np.diff(points, axis=0), ord=2, axis=1)
+    return np.concatenate(([0.0], np.cumsum(seg)))
+
+
+def _clean_and_interpolate_track(
+    pos: np.ndarray,
+    scale: np.ndarray,
+    index_frames: np.ndarray,
+    interp_factor: float,
+    smooth_window: int = 5,
+    intensities: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    """Arc-length track cleaning: smooth, then resample uniformly in arc
+    length (not frame index) and recover a fractional-frame timeline.
+
+    Returns (positions, velocities_mm_per_s, frames, intensities) all aligned
+    to the resampled point count (``intensities`` is None when not supplied).
+    Brightness is interpolated against the same arc-length parameterization as
+    position. Falls back to the input track when it is too short or degenerate
+    (zero total arc length).
+    """
+    pos = _moving_average_smooth(np.asarray(pos, dtype=np.float64), window=smooth_window)
+    inten = None if intensities is None else np.asarray(intensities, dtype=np.float64)
+    ca = _curvilinear_abscissa(pos)
+    step = float(interp_factor) * float(np.min(scale[:3]))
+    if ca[-1] <= 0.0 or step <= 0.0:
+        return pos, np.zeros_like(pos), np.asarray(index_frames, dtype=np.float64), inten
+    ca_interp = np.arange(ca[0], ca[-1], step)
+    if len(ca_interp) < 2:
+        return pos, np.zeros_like(pos), np.asarray(index_frames, dtype=np.float64), inten
+
+    pos_i = np.zeros([len(ca_interp), pos.shape[1]], dtype=pos.dtype)
+    for axis in range(pos_i.shape[1]):
+        pos_i[:, axis] = np.interp(ca_interp, ca, pos[:, axis])
+    pos_i = _moving_average_smooth(pos_i, scale[2] * 2)
+    # Brightness rides the same arc-length grid as the pre-resample positions.
+    int_i = None if inten is None else np.interp(ca_interp, ca, inten)
+
+    ca_i = _curvilinear_abscissa(pos_i)
+    tl = np.asarray(index_frames, dtype=np.float64) * scale[-1]  # timeline in seconds
+    tl_i = np.interp(ca_i / ca_i[-1], ca / ca[-1], tl)
+    dt_line = np.diff(tl_i)
+    dt_line[dt_line == 0] = 1e-12
+    vel = np.diff(pos_i, axis=0) / dt_line[:, None]
+    vel = np.vstack([vel[0, :], vel])
+    frames_i = tl_i / scale[-1]
+    # The second smoothing pass can change pos_i's length; keep brightness aligned.
+    if int_i is not None and len(int_i) != len(pos_i):
+        int_i = np.interp(
+            np.linspace(0.0, 1.0, len(pos_i)),
+            np.linspace(0.0, 1.0, len(int_i)),
+            int_i,
+        )
+    return pos_i, vel, frames_i, int_i
+
+
+def _smooth_tracks(
+    tracks: list[dict],
+    sigma: float,
+    method: str = "gaussian",
+    scale: np.ndarray | None = None,
+    interp_factor: float = 0.1,
+    window: int = 5,
+) -> list[dict]:
+    """Post-process track positions.
+
+    method="gaussian" (default): per-axis 1D Gaussian along the track.
+    method="3dulm": arc-length resampling/interpolation (needs ``scale``,
+    a length-4 [dx, dy, dz, dt] array). 3dulm changes the point count; per-point
+    ``intensities`` (brightness) are interpolated onto the resampled points.
+    """
     smoothed = []
     for track in tracks:
         positions = np.asarray(track["positions"], dtype=np.float32)
+        frames = np.asarray(track["frames"], dtype=np.float32)
+        track_int = track.get("intensities")
         out = dict(track)
-        if len(positions) >= 3:
-            positions = positions.copy()
-            for axis in range(3):
-                positions[:, axis] = gaussian_filter1d(positions[:, axis], sigma=sigma, mode="nearest")
-        out["positions"] = positions
-        out["frames"] = np.asarray(track["frames"], dtype=np.float32)
-        out["length"] = int(len(positions))
+        if method == "3dulm":
+            if scale is None:
+                raise ValueError("3dulm smoothing requires a [dx, dy, dz, dt] scale")
+            if len(positions) >= 3:
+                pos_i, _vel, frames_i, int_i = _clean_and_interpolate_track(
+                    positions, np.asarray(scale, dtype=np.float64),
+                    frames, interp_factor, window, intensities=track_int,
+                )
+                out["positions"] = pos_i.astype(np.float32)
+                out["frames"] = frames_i.astype(np.float32)
+                out["length"] = int(len(pos_i))
+                if int_i is not None:
+                    out["intensities"] = int_i.astype(np.float32)
+            else:
+                out["positions"] = positions
+                out["frames"] = frames
+                out["length"] = int(len(positions))
+        else:
+            if len(positions) >= 3:
+                positions = positions.copy()
+                for axis in range(3):
+                    positions[:, axis] = gaussian_filter1d(positions[:, axis], sigma=sigma, mode="nearest")
+            out["positions"] = positions
+            out["frames"] = frames
+            out["length"] = int(len(positions))
         smoothed.append(out)
     return smoothed
+
+
+def _scale_from_pickle(data: dict) -> np.ndarray:
+    """Build a [dx, dy, dz, dt] scale from a tracks pickle's spacing + frame rate."""
+    spacing = data.get("spacing") or {}
+    dx, dy, dz = spacing.get("dx"), spacing.get("dy"), spacing.get("dz")
+    fr = (data.get("params") or {}).get("frame_rate_hz")
+    if None in (dx, dy, dz) or not fr:
+        raise SystemExit(
+            "3dulm smoothing needs spacing dx/dy/dz and params.frame_rate_hz in the pickle"
+        )
+    return np.array([dx, dy, dz, 1.0 / float(fr)], dtype=np.float64)
 
 
 def smooth_tracks_pickle(
     tracks_path: Path,
     output_path: Path | None,
     sigma: float,
+    method: str = "gaussian",
+    interp_factor: float = 0.1,
+    window: int = 5,
 ) -> Path:
     data = load_pickle(tracks_path)
-    smoothed = _smooth_tracks(data.get("tracks", []), sigma=sigma)
+    scale = _scale_from_pickle(data) if method == "3dulm" else None
+    smoothed = _smooth_tracks(
+        data.get("tracks", []), sigma=sigma, method=method,
+        scale=scale, interp_factor=interp_factor, window=window,
+    )
     data["tracks_smoothed"] = smoothed
     data.setdefault("params", {})
     data["params"].update(
         {
-            "post_smoothing_method": "gaussian",
+            "post_smoothing_method": method,
             "post_smoothing_sigma": float(sigma),
+            "post_smoothing_interp_factor": float(interp_factor),
+            "post_smoothing_window": int(window),
         }
     )
     out = output_path or tracks_path.with_name(f"{tracks_path.stem}_smoothed.pkl")
     dump_pickle(data, out)
-    print(f"Smoothed {len(smoothed)} tracks -> {out}")
+    print(f"Smoothed {len(smoothed)} tracks ({method}) -> {out}")
     return out
 
 
@@ -1015,7 +1157,10 @@ def export_tracks_bin(
 
 def run_tracking_outputs(opts: TrackingOptions) -> Path:
     tracks = run_tracking(opts)
-    smoothed = smooth_tracks_pickle(tracks, None, sigma=opts.smooth_sigma)
+    smoothed = smooth_tracks_pickle(
+        tracks, None, sigma=opts.smooth_sigma, method=opts.smooth_method,
+        interp_factor=opts.smooth_interp_factor, window=opts.smooth_window,
+    )
     if opts.export_dir:
         stem = opts.export_stem or tracks.stem
         for min_length in opts.export_min_lengths:
@@ -1066,6 +1211,9 @@ def make_options(args) -> TrackingOptions:
         reversal_penalty=args.reversal_penalty,
         max_cost=args.max_cost,
         smooth_sigma=args.smooth_sigma,
+        smooth_method=getattr(args, "smooth_method", "gaussian"),
+        smooth_window=getattr(args, "smooth_window", 5),
+        smooth_interp_factor=getattr(args, "smooth_interp_factor", 0.1),
         export_dir=Path(args.export_dir).expanduser().resolve() if args.export_dir else None,
         export_stem=args.export_stem,
         export_min_lengths=tuple(args.min_lengths),
