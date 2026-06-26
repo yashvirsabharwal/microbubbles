@@ -94,10 +94,13 @@ def add_tracking_args(parser: argparse.ArgumentParser, require_beamformed: bool 
     parser.add_argument("--max-dist", type=float, nargs=3, default=None)
     parser.add_argument("--max-dist-mms", type=float, nargs=3, default=None)
     parser.add_argument("--max-gap", type=int, default=3)
-    parser.add_argument("--min-track-length", type=int, default=5)
+    parser.add_argument("--min-track-length", type=int, default=15)
     parser.add_argument("--reversal-penalty", type=float, default=10.0)
     parser.add_argument("--max-cost", type=float, default=10.0)
     parser.add_argument("--smooth-sigma", type=float, default=2.0)
+    parser.add_argument("--smooth-method", choices=["gaussian", "3dulm"], default="gaussian")
+    parser.add_argument("--smooth-window", type=int, default=5)
+    parser.add_argument("--smooth-interp-factor", type=float, default=0.1)
     parser.add_argument("--export-dir", default=None)
     parser.add_argument("--export-stem", default=None)
     parser.add_argument("--min-lengths", type=int, nargs="+", default=[5, 20, 50])
@@ -231,6 +234,9 @@ def cmd_export(args: argparse.Namespace) -> None:
         Path(args.tracks).expanduser().resolve(),
         Path(args.smoothed).expanduser().resolve() if args.smoothed else None,
         sigma=args.smooth_sigma,
+        method=args.smooth_method,
+        interp_factor=args.smooth_interp_factor,
+        window=args.smooth_window,
     )
     output_dir = Path(args.export_dir).expanduser().resolve()
     stem = args.export_stem or smoothed.stem
