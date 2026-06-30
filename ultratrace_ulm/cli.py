@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from .beamform_mach import beamform_mach, make_options as make_beamform_options
-from .download import SAMPLE_FILENAME, SAMPLE_URL, download_sample
+from .download import SAMPLE_FILENAME, SAMPLE_URL, download_sample, download_sample_auto, download_sample_parallel
 from .tracking import (
     export_tracks_bin,
     make_options as make_tracking_options,
@@ -122,7 +122,19 @@ def cmd_track_export(args: argparse.Namespace) -> None:
 
 
 def cmd_download(args: argparse.Namespace) -> None:
-    download_sample(args.url, args.output, force=args.force)
+    if args.connections == "auto":
+        download_sample_auto(
+            args.url,
+            args.output,
+            force=args.force,
+            recheck_seconds=args.recheck_seconds,
+        )
+    else:
+        connections = int(args.connections)
+        if connections > 1:
+            download_sample_parallel(args.url, args.output, force=args.force, connections=connections)
+        else:
+            download_sample(args.url, args.output, force=args.force)
 
 
 def _stage(label: str) -> None:
@@ -293,6 +305,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", default=SAMPLE_FILENAME, help="Destination path.")
     p.add_argument("--url", default=SAMPLE_URL, help="Source URL.")
     p.add_argument("--force", action="store_true", help="Re-download even if present.")
+    p.add_argument(
+        "--connections",
+        default="auto",
+        help='Parallel HTTP range connections, or "auto" to benchmark and choose. Default: auto.',
+    )
+    p.add_argument(
+        "--recheck-seconds",
+        type=float,
+        default=300.0,
+        help="In auto mode, re-benchmark this often and switch modes for future segments.",
+    )
     p.set_defaults(func=cmd_download)
 
     p = sub.add_parser(
